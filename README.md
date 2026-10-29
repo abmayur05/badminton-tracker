@@ -12,16 +12,13 @@ uv run python -m uvicorn main:app --reload
 - Website: <http://127.0.0.1:8000>
 - MCP endpoint (Streamable HTTP): <http://127.0.0.1:8000/mcp>
 
-> Use `python -m uvicorn` / `python -m pytest` rather than `uv run uvicorn` /
-> `uv run pytest`: launching `.exe` files from this OneDrive folder is blocked
-> ("Access is denied").
-
-### First-time setup (only if `.venv` is missing)
+### First-time setup
 
 ```powershell
-$env:UV_LINK_MODE = "copy"   # OneDrive doesn't support uv's hardlinks
-uv sync --native-tls          # --native-tls trusts the corporate TLS proxy certificate
+uv sync
 ```
+
+If you're behind a corporate TLS proxy, use `uv sync --native-tls`.
 
 ## What it tracks
 
