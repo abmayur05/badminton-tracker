@@ -191,10 +191,10 @@ def test_migrates_old_multi_game_matches_into_single_score_matches(tmp_path, mon
     for sql in [
         "CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, session_date TEXT NOT NULL, venue TEXT NOT NULL, "
         "duration_minutes INTEGER NOT NULL, notes TEXT NOT NULL DEFAULT '', is_sample INTEGER NOT NULL DEFAULT 0)",
-        "CREATE TABLE matches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, "
+        "CREATE TABLE matches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL REFERENCES sessions(id), "
         "points_to_win INTEGER NOT NULL DEFAULT 21, won INTEGER NOT NULL, notes TEXT NOT NULL DEFAULT '')",
-        "CREATE TABLE games (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id INTEGER NOT NULL, game_no INTEGER NOT NULL, "
-        "my_score INTEGER NOT NULL, opp_score INTEGER NOT NULL)",
+        "CREATE TABLE games (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id INTEGER NOT NULL REFERENCES matches(id), "
+        "game_no INTEGER NOT NULL, my_score INTEGER NOT NULL, opp_score INTEGER NOT NULL)",
         "CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         "INSERT INTO app_meta VALUES ('seeded', '1')",
         "INSERT INTO sessions (session_date, venue, duration_minutes) VALUES ('2026-10-29', 'Dazhong', 90)",

@@ -108,7 +108,10 @@ def get_connection() -> _Connection:
     if os.environ.get("VERCEL"):
         # Vercel's filesystem is read-only and ephemeral -- a local file would fail or lose data.
         raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set when running on Vercel")
-    return _Connection(libsql.connect(str(DB_PATH)))
+    # Turso enforces foreign keys; do the same locally so tests catch FK violations.
+    conn = _Connection(libsql.connect(str(DB_PATH)))
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def init_db(seed: bool = True):
@@ -127,12 +130,12 @@ def init_db(seed: bool = True):
 
 def _migrate_to_single_score_matches(conn):
     """One-time upgrade: matches used to be best-of-3 with scores in a `games` table.
-    Each old game becomes its own match (same session, target, and order)."""
-    if conn.execute("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('single_score_matches', '1')").rowcount != 1:
-        return
-    columns = {r["name"] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
+    Each old game becomes its own match (same session, target, and order).
+
+    Driven by the schema itself (not a flag), so it is safe to re-run after a failure."""
+    matches_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'matches'").fetchone()[0]
     for column in ("my_score", "opp_score"):
-        if column not in columns:
+        if column not in matches_sql:
             conn.execute(f"ALTER TABLE matches ADD COLUMN {column} INTEGER")
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'games'").fetchone():
         return
@@ -141,6 +144,8 @@ def _migrate_to_single_score_matches(conn):
         FROM matches m JOIN games g ON g.match_id = m.id
         ORDER BY m.id, g.game_no
     """).fetchall()
+    # Drop games first: its rows reference matches, and Turso enforces foreign keys.
+    conn.execute("DROP TABLE games")
     conn.execute("DELETE FROM matches")
     previous_match = None
     for g in old_games:
@@ -150,7 +155,6 @@ def _migrate_to_single_score_matches(conn):
              g["notes"] if g["match_id"] != previous_match else "", g["my_score"], g["opp_score"]),
         )
         previous_match = g["match_id"]
-    conn.execute("DROP TABLE games")
 
 
 def _seed_sample_data():
