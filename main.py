@@ -142,7 +142,9 @@ If there are no sessions that week, say so plainly instead of inventing data.
 
 
 # path="/" here, NOT "/mcp" -- app.mount() below adds that prefix.
-mcp_app = mcp.http_app(path="/")
+# stateless_http: no per-client session kept in memory, so it works on serverless
+# hosts (Vercel) where consecutive requests can land on different instances.
+mcp_app = mcp.http_app(path="/", stateless_http=True)
 
 
 # ---------- Step 2: FastAPI app, MCP lifespan wired in at construction ----------

@@ -89,9 +89,53 @@ uv run python -m pytest
 
 Tests use a temporary database, never your real `badminton.db`.
 
+## Deploy to Vercel
+
+Vercel's filesystem is read-only and temporary, so the hosted app stores data in
+[Turso](https://turso.tech) (hosted SQLite, free tier) instead of `badminton.db`.
+The app switches automatically when `TURSO_DATABASE_URL` is set.
+
+### 1. Create the Turso database
+
+1. Sign in at <https://app.turso.tech> (GitHub login works).
+2. **Create Database** → name it `badminton-tracker` → pick the region closest to
+   your Vercel functions (Vercel's default is Washington, D.C. — AWS `us-east-1`).
+3. Open the database and copy its **URL** (starts with `libsql://`).
+4. **Create Token** → read & write → copy the token. It's shown only once.
+
+### 2. Deploy on Vercel
+
+1. Sign in at <https://vercel.com> with GitHub.
+2. **Add New → Project** → import the `badminton-tracker` repository.
+   Vercel detects FastAPI (`main.py` → `app`) and Python 3.13 automatically.
+3. Under **Environment Variables**, add:
+
+   | Name | Value |
+   |---|---|
+   | `TURSO_DATABASE_URL` | the `libsql://…` URL |
+   | `TURSO_AUTH_TOKEN` | the token |
+
+4. **Deploy**. Tables and sample data are created on the first request.
+
+Your app is at `https://<project>.vercel.app`, and the MCP endpoint at
+`https://<project>.vercel.app/mcp`. Every push to `main` redeploys automatically.
+
+> **Note:** the app has no login. Anyone with the URL can view, edit, and delete
+> data — through the website or MCP. Keep the URL private, or enable
+> **Vercel Authentication** under *Settings → Deployment Protection*
+> (this also blocks MCP clients that can't sign in).
+
+### Try Turso locally first (optional)
+
+```powershell
+$env:TURSO_DATABASE_URL = "libsql://<your-db>.turso.io"
+$env:TURSO_AUTH_TOKEN = "<token>"
+uv run python -m uvicorn main:app --reload
+```
+
 ## Files
 
-- `database.py` — SQLite schema, score validation, CRUD, and stats
+- `database.py` — schema, score validation, CRUD, and stats (local SQLite file or Turso)
 - `main.py` — FastAPI app with the MCP server mounted at `/mcp`
 - `static/` — the website
 - `tests/` — database, REST, and MCP tests

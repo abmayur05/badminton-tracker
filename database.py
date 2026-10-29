@@ -1,16 +1,21 @@
 """
-Badminton Tracker's persistence layer -- SQLite, shared by the website and
-the MCP server. Tracks personal badminton play: sessions (date, venue,
-duration), the matches played in each session, and the per-game scores.
+Badminton Tracker's persistence layer -- SQLite (via libSQL), shared by the
+website and the MCP server. Tracks personal badminton play: sessions (date,
+venue, duration), the matches played in each session, and the per-game scores.
+
+Storage:
+    TURSO_DATABASE_URL set -> remote Turso database (used on Vercel)
+    otherwise              -> local file badminton.db (or BADMINTON_DB_PATH)
 
 Errors:
     ValueError  -> invalid input (REST returns 400)
     LookupError -> unknown id     (REST returns 404)
 """
 import os
-import sqlite3
 from datetime import date
 from pathlib import Path
+
+import libsql
 
 DB_PATH = Path(os.environ.get("BADMINTON_DB_PATH", Path(__file__).parent / "badminton.db"))
 
@@ -19,50 +24,108 @@ DEFAULT_POINTS_TO_WIN = 21
 CAP_MARGIN = 9  # 21 -> 30, 15 -> 24, 11 -> 20
 MAX_SESSION_MINUTES = 24 * 60
 
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_date TEXT NOT NULL,
+        venue TEXT NOT NULL,
+        duration_minutes INTEGER NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        is_sample INTEGER NOT NULL DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id),
+        points_to_win INTEGER NOT NULL DEFAULT 21,
+        won INTEGER NOT NULL,
+        notes TEXT NOT NULL DEFAULT ''
+    )""",
+    """CREATE TABLE IF NOT EXISTS games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER NOT NULL REFERENCES matches(id),
+        game_no INTEGER NOT NULL,
+        my_score INTEGER NOT NULL,
+        opp_score INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
+]
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+
+class _Row:
+    """A result row readable by column name or position, like sqlite3.Row."""
+
+    __slots__ = ("_values", "_index")
+
+    def __init__(self, values: tuple, index: dict[str, int]):
+        self._values = values
+        self._index = index
+
+    def __getitem__(self, key):
+        return self._values[key if isinstance(key, int) else self._index[key]]
+
+
+class _Cursor:
+    """Snapshot of one statement's results.
+
+    libSQL reuses a single cursor per connection, so a later execute() would
+    overwrite lastrowid/rows of an earlier one -- capture them immediately.
+    """
+
+    def __init__(self, cursor):
+        self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+        index = {col[0]: i for i, col in enumerate(cursor.description or ())}
+        self._rows = [_Row(row, index) for row in cursor.fetchall()] if index else []
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _Connection:
+    """libSQL's connection has no row_factory, so wrap it to return named rows."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params=()):
+        return _Cursor(self._conn.execute(sql, tuple(params)))
+
+    def executemany(self, sql: str, seq):
+        return _Cursor(self._conn.executemany(sql, [tuple(p) for p in seq]))
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def get_connection() -> _Connection:
+    turso_url = os.environ.get("TURSO_DATABASE_URL")
+    if turso_url:
+        return _Connection(libsql.connect(database=turso_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", "")))
+    if os.environ.get("VERCEL"):
+        # Vercel's filesystem is read-only and ephemeral -- a local file would fail or lose data.
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set when running on Vercel")
+    return _Connection(libsql.connect(str(DB_PATH)))
 
 
 def init_db(seed: bool = True):
     conn = get_connection()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_date TEXT NOT NULL,
-            venue TEXT NOT NULL,
-            duration_minutes INTEGER NOT NULL,
-            notes TEXT NOT NULL DEFAULT '',
-            is_sample INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            points_to_win INTEGER NOT NULL DEFAULT 21,
-            won INTEGER NOT NULL,
-            notes TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS games (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-            game_no INTEGER NOT NULL,
-            my_score INTEGER NOT NULL,
-            opp_score INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS app_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-    """)
+    for statement in SCHEMA:
+        conn.execute(statement)
     # Seed only once, ever -- so deleting the samples doesn't bring them back on restart.
-    already_seeded = conn.execute("SELECT 1 FROM app_meta WHERE key = 'seeded'").fetchone()
-    conn.execute("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('seeded', '1')")
+    # The INSERT claims seeding atomically, so concurrent cold starts can't both seed.
+    claimed = conn.execute("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('seeded', '1')").rowcount == 1
     conn.commit()
     conn.close()
-    if seed and not already_seeded:
+    if seed and claimed:
         _seed_sample_data()
 
 
@@ -193,9 +256,19 @@ def update_session(session_id: int, session_date: str | None = None, venue: str 
     return get_session(session_id)
 
 
+def _delete_sessions_where(conn, condition: str, params: tuple) -> int:
+    """Delete sessions plus their matches and games (explicitly -- no reliance on FK cascades)."""
+    session_ids = f"SELECT id FROM sessions WHERE {condition}"
+    conn.execute(
+        f"DELETE FROM games WHERE match_id IN (SELECT id FROM matches WHERE session_id IN ({session_ids}))", params
+    )
+    conn.execute(f"DELETE FROM matches WHERE session_id IN ({session_ids})", params)
+    return conn.execute(f"DELETE FROM sessions WHERE {condition}", params).rowcount
+
+
 def delete_session(session_id: int) -> dict:
     conn = get_connection()
-    deleted = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,)).rowcount
+    deleted = _delete_sessions_where(conn, "id = ?", (session_id,))
     conn.commit()
     conn.close()
     if not deleted:
@@ -344,6 +417,7 @@ def update_match(match_id: int, games: list[dict] | None = None, points_to_win: 
 
 def delete_match(match_id: int) -> dict:
     conn = get_connection()
+    conn.execute("DELETE FROM games WHERE match_id = ?", (match_id,))
     deleted = conn.execute("DELETE FROM matches WHERE id = ?", (match_id,)).rowcount
     conn.commit()
     conn.close()
@@ -363,7 +437,7 @@ def has_sample_data() -> bool:
 
 def delete_sample_data() -> dict:
     conn = get_connection()
-    deleted = conn.execute("DELETE FROM sessions WHERE is_sample = 1").rowcount
+    deleted = _delete_sessions_where(conn, "is_sample = 1", ())
     conn.commit()
     conn.close()
     return {"deleted_sessions": deleted}

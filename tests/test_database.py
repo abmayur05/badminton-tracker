@@ -190,6 +190,28 @@ def test_sample_data_seeds_once_and_deletes_only_samples(tmp_path, monkeypatch):
     assert db.delete_sample_data() == {"deleted_sessions": sample_sessions}
     assert [s["id"] for s in db.list_sessions()] == [mine["id"]]
     assert not db.has_sample_data()
+    conn = db.get_connection()
+    assert conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    conn.close()
 
     db.init_db()  # simulate restart: samples must not come back
     assert not db.has_sample_data()
+
+
+# ---------- connection selection ----------
+
+def test_uses_turso_when_url_is_set(monkeypatch):
+    calls = []
+    monkeypatch.setenv("TURSO_DATABASE_URL", "libsql://example.turso.io")
+    monkeypatch.setenv("TURSO_AUTH_TOKEN", "secret")
+    monkeypatch.setattr(db.libsql, "connect", lambda **kwargs: calls.append(kwargs) or object())
+    db.get_connection()
+    assert calls == [{"database": "libsql://example.turso.io", "auth_token": "secret"}]
+
+
+def test_refuses_local_file_on_vercel(monkeypatch):
+    monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+    monkeypatch.setenv("VERCEL", "1")
+    with pytest.raises(RuntimeError, match="TURSO_DATABASE_URL"):
+        db.get_connection()
