@@ -1,7 +1,8 @@
 """
 Badminton Tracker's persistence layer -- SQLite (via libSQL), shared by the
 website and the MCP server. Tracks personal badminton play: sessions (date,
-venue, duration), the matches played in each session, and the per-game scores.
+venue, duration in hours) and the matches played in each session -- one
+score per match, any number of matches per session.
 
 Storage:
     TURSO_DATABASE_URL set -> remote Turso database (used on Vercel)
@@ -22,8 +23,10 @@ DB_PATH = Path(os.environ.get("BADMINTON_DB_PATH", Path(__file__).parent / "badm
 ALLOWED_POINT_TARGETS = (11, 15, 21)
 DEFAULT_POINTS_TO_WIN = 21
 CAP_MARGIN = 9  # 21 -> 30, 15 -> 24, 11 -> 20
-MAX_SESSION_MINUTES = 24 * 60
+MAX_SESSION_HOURS = 24
 
+# Durations are entered in whole hours but stored in minutes, so sessions
+# logged before the switch to hours keep their exact length.
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,14 +41,9 @@ SCHEMA = [
         session_id INTEGER NOT NULL REFERENCES sessions(id),
         points_to_win INTEGER NOT NULL DEFAULT 21,
         won INTEGER NOT NULL,
-        notes TEXT NOT NULL DEFAULT ''
-    )""",
-    """CREATE TABLE IF NOT EXISTS games (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_id INTEGER NOT NULL REFERENCES matches(id),
-        game_no INTEGER NOT NULL,
-        my_score INTEGER NOT NULL,
-        opp_score INTEGER NOT NULL
+        notes TEXT NOT NULL DEFAULT '',
+        my_score INTEGER,
+        opp_score INTEGER
     )""",
     """CREATE TABLE IF NOT EXISTS app_meta (
         key TEXT PRIMARY KEY,
@@ -96,9 +94,6 @@ class _Connection:
     def execute(self, sql: str, params=()):
         return _Cursor(self._conn.execute(sql, tuple(params)))
 
-    def executemany(self, sql: str, seq):
-        return _Cursor(self._conn.executemany(sql, [tuple(p) for p in seq]))
-
     def commit(self):
         self._conn.commit()
 
@@ -120,6 +115,7 @@ def init_db(seed: bool = True):
     conn = get_connection()
     for statement in SCHEMA:
         conn.execute(statement)
+    _migrate_to_single_score_matches(conn)
     # Seed only once, ever -- so deleting the samples doesn't bring them back on restart.
     # The INSERT claims seeding atomically, so concurrent cold starts can't both seed.
     claimed = conn.execute("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('seeded', '1')").rowcount == 1
@@ -129,27 +125,47 @@ def init_db(seed: bool = True):
         _seed_sample_data()
 
 
+def _migrate_to_single_score_matches(conn):
+    """One-time upgrade: matches used to be best-of-3 with scores in a `games` table.
+    Each old game becomes its own match (same session, target, and order)."""
+    if conn.execute("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('single_score_matches', '1')").rowcount != 1:
+        return
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
+    for column in ("my_score", "opp_score"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE matches ADD COLUMN {column} INTEGER")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'games'").fetchone():
+        return
+    old_games = conn.execute("""
+        SELECT m.id AS match_id, m.session_id, m.points_to_win, m.notes, g.my_score, g.opp_score
+        FROM matches m JOIN games g ON g.match_id = m.id
+        ORDER BY m.id, g.game_no
+    """).fetchall()
+    conn.execute("DELETE FROM matches")
+    previous_match = None
+    for g in old_games:
+        conn.execute(
+            "INSERT INTO matches (session_id, points_to_win, won, notes, my_score, opp_score) VALUES (?, ?, ?, ?, ?, ?)",
+            (g["session_id"], g["points_to_win"], int(g["my_score"] > g["opp_score"]),
+             g["notes"] if g["match_id"] != previous_match else "", g["my_score"], g["opp_score"]),
+        )
+        previous_match = g["match_id"]
+    conn.execute("DROP TABLE games")
+
+
 def _seed_sample_data():
     samples = [
-        ("2026-09-06", "Sports Hub Court 3", 120, "Saturday club night", [
-            [(21, 18), (21, 15)],
-            [(19, 21), (21, 17), (18, 21)],
-            [(22, 20), (21, 19)],
-        ]),
-        ("2026-09-13", "Community Centre", 90, "", [
-            [(21, 12), (21, 16)],
-            [(15, 21), (17, 21)],
-        ]),
-        ("2026-10-04", "Sports Hub Court 3", 120, "Tough opponents", [
-            [(21, 19), (19, 21), (21, 23)],
-            [(30, 29), (21, 18)],
-            [(14, 21), (16, 21)],
-        ]),
+        ("2026-09-06", "Sports Hub Court 3", 2, "Saturday club night",
+         [(21, 18), (21, 15), (19, 21), (21, 17), (22, 20)]),
+        ("2026-09-13", "Community Centre", 1, "",
+         [(21, 12), (15, 21), (17, 21)]),
+        ("2026-10-04", "Sports Hub Court 3", 2, "Tough opponents",
+         [(21, 19), (21, 23), (30, 29), (14, 21)]),
     ]
-    for session_date, venue, minutes, notes, matches in samples:
-        session = create_session(session_date, venue, minutes, notes, _is_sample=True)
-        for games in matches:
-            log_match(session["id"], [{"my_score": m, "opp_score": o} for m, o in games])
+    for session_date, venue, hours, notes, scores in samples:
+        session = create_session(session_date, venue, hours, notes, _is_sample=True)
+        for my_score, opp_score in scores:
+            log_match(session["id"], my_score, opp_score)
 
 
 # ---------- validation ----------
@@ -161,20 +177,28 @@ def _validate_date(value: str, field: str = "date") -> str:
         raise ValueError(f"{field} must be a valid date in YYYY-MM-DD format, got {value!r}")
 
 
-def _validate_session_fields(session_date: str, venue: str, duration_minutes: int) -> tuple[str, str, int]:
+def _validate_hours(duration_hours) -> int:
+    if isinstance(duration_hours, float) and duration_hours.is_integer():
+        duration_hours = int(duration_hours)
+    if isinstance(duration_hours, bool) or not isinstance(duration_hours, int):
+        raise ValueError("duration_hours must be a whole number of hours, e.g. 1, 2, 3")
+    if not 1 <= duration_hours <= MAX_SESSION_HOURS:
+        raise ValueError(f"duration_hours must be between 1 and {MAX_SESSION_HOURS}")
+    return duration_hours
+
+
+def _validate_session_fields(session_date: str, venue: str) -> tuple[str, str]:
     session_date = _validate_date(session_date, "session_date")
     venue = (venue or "").strip()
     if not venue:
         raise ValueError("venue is required")
-    if isinstance(duration_minutes, bool) or not isinstance(duration_minutes, int):
-        raise ValueError("duration_minutes must be a whole number")
-    if not 0 < duration_minutes <= MAX_SESSION_MINUTES:
-        raise ValueError(f"duration_minutes must be between 1 and {MAX_SESSION_MINUTES}")
-    return session_date, venue, duration_minutes
+    return session_date, venue
 
 
-def validate_game(my_score: int, opp_score: int, points_to_win: int = DEFAULT_POINTS_TO_WIN) -> bool:
-    """Validate one game's final score under rally scoring. Returns True if I won."""
+def validate_score(my_score: int, opp_score: int, points_to_win: int = DEFAULT_POINTS_TO_WIN) -> bool:
+    """Validate a match's final score under rally scoring. Returns True if I won."""
+    if points_to_win not in ALLOWED_POINT_TARGETS:
+        raise ValueError(f"points_to_win must be one of {ALLOWED_POINT_TARGETS}")
     for s in (my_score, opp_score):
         if isinstance(s, bool) or not isinstance(s, int) or s < 0:
             raise ValueError("scores must be non-negative whole numbers")
@@ -182,9 +206,9 @@ def validate_game(my_score: int, opp_score: int, points_to_win: int = DEFAULT_PO
     winner, loser = max(my_score, opp_score), min(my_score, opp_score)
     score = f"{my_score}-{opp_score}"
     if winner == loser:
-        raise ValueError(f"game {score} is a tie; a game must have a winner")
+        raise ValueError(f"score {score} is a tie; a match must have a winner")
     if winner < points_to_win:
-        raise ValueError(f"game {score} is unfinished; the winner needs at least {points_to_win} points")
+        raise ValueError(f"score {score} is unfinished; the winner needs at least {points_to_win} points")
     if winner == points_to_win:
         valid = loser <= points_to_win - 2
     elif winner < cap:
@@ -195,74 +219,50 @@ def validate_game(my_score: int, opp_score: int, points_to_win: int = DEFAULT_PO
         valid = False
     if not valid:
         raise ValueError(
-            f"game {score} is not a valid final score for games to {points_to_win} "
+            f"score {score} is not a valid final score for games to {points_to_win} "
             f"(win by 2, capped at {cap})"
         )
     return my_score > opp_score
 
 
-def validate_match(games: list[dict], points_to_win: int = DEFAULT_POINTS_TO_WIN) -> bool:
-    """Validate a best-of-3 match. Returns True if I won."""
-    if points_to_win not in ALLOWED_POINT_TARGETS:
-        raise ValueError(f"points_to_win must be one of {ALLOWED_POINT_TARGETS}")
-    if not isinstance(games, list) or not 2 <= len(games) <= 3:
-        raise ValueError("a match must have 2 or 3 games")
-    my_wins = opp_wins = 0
-    for i, game in enumerate(games, start=1):
-        if my_wins == 2 or opp_wins == 2:
-            raise ValueError(f"game {i} was played after the match was already decided")
-        try:
-            my_score, opp_score = game["my_score"], game["opp_score"]
-        except (KeyError, TypeError):
-            raise ValueError("each game needs my_score and opp_score")
-        if validate_game(my_score, opp_score, points_to_win):
-            my_wins += 1
-        else:
-            opp_wins += 1
-    if max(my_wins, opp_wins) != 2:
-        raise ValueError("match is incomplete; someone must win 2 games")
-    return my_wins == 2
-
-
 # ---------- sessions ----------
 
-def create_session(session_date: str, venue: str, duration_minutes: int, notes: str = "", _is_sample: bool = False) -> dict:
-    session_date, venue, duration_minutes = _validate_session_fields(session_date, venue, duration_minutes)
+def create_session(session_date: str, venue: str, duration_hours: int, notes: str = "", _is_sample: bool = False) -> dict:
+    session_date, venue = _validate_session_fields(session_date, venue)
+    minutes = _validate_hours(duration_hours) * 60
     conn = get_connection()
-    cursor = conn.execute(
+    session_id = conn.execute(
         "INSERT INTO sessions (session_date, venue, duration_minutes, notes, is_sample) VALUES (?, ?, ?, ?, ?)",
-        (session_date, venue, duration_minutes, notes or "", int(_is_sample)),
-    )
+        (session_date, venue, minutes, notes or "", int(_is_sample)),
+    ).lastrowid
     conn.commit()
     conn.close()
-    return get_session(cursor.lastrowid)
+    return get_session(session_id)
 
 
 def update_session(session_id: int, session_date: str | None = None, venue: str | None = None,
-                   duration_minutes: int | None = None, notes: str | None = None) -> dict:
+                   duration_hours: int | None = None, notes: str | None = None) -> dict:
     current = get_session(session_id)
-    session_date, venue, duration_minutes = _validate_session_fields(
+    session_date, venue = _validate_session_fields(
         session_date if session_date is not None else current["session_date"],
         venue if venue is not None else current["venue"],
-        duration_minutes if duration_minutes is not None else current["duration_minutes"],
     )
     conn = get_connection()
     conn.execute(
-        "UPDATE sessions SET session_date = ?, venue = ?, duration_minutes = ?, notes = ? WHERE id = ?",
-        (session_date, venue, duration_minutes, notes if notes is not None else current["notes"], session_id),
+        "UPDATE sessions SET session_date = ?, venue = ?, notes = ? WHERE id = ?",
+        (session_date, venue, notes if notes is not None else current["notes"], session_id),
     )
+    if duration_hours is not None:
+        conn.execute("UPDATE sessions SET duration_minutes = ? WHERE id = ?",
+                     (_validate_hours(duration_hours) * 60, session_id))
     conn.commit()
     conn.close()
     return get_session(session_id)
 
 
 def _delete_sessions_where(conn, condition: str, params: tuple) -> int:
-    """Delete sessions plus their matches and games (explicitly -- no reliance on FK cascades)."""
-    session_ids = f"SELECT id FROM sessions WHERE {condition}"
-    conn.execute(
-        f"DELETE FROM games WHERE match_id IN (SELECT id FROM matches WHERE session_id IN ({session_ids}))", params
-    )
-    conn.execute(f"DELETE FROM matches WHERE session_id IN ({session_ids})", params)
+    """Delete sessions plus their matches (explicitly -- no reliance on FK cascades)."""
+    conn.execute(f"DELETE FROM matches WHERE session_id IN (SELECT id FROM sessions WHERE {condition})", params)
     return conn.execute(f"DELETE FROM sessions WHERE {condition}", params).rowcount
 
 
@@ -305,6 +305,11 @@ def list_venues() -> list[str]:
     return [r["venue"] for r in rows]
 
 
+def _hours(minutes: int) -> int | float:
+    hours = round(minutes / 60, 2)
+    return int(hours) if hours == int(hours) else hours
+
+
 def _load_sessions(where: str, params: list) -> list[dict]:
     conn = get_connection()
     session_rows = conn.execute(
@@ -315,7 +320,7 @@ def _load_sessions(where: str, params: list) -> list[dict]:
             "id": r["id"],
             "session_date": r["session_date"],
             "venue": r["venue"],
-            "duration_minutes": r["duration_minutes"],
+            "duration_hours": _hours(r["duration_minutes"]),
             "notes": r["notes"],
             "is_sample": bool(r["is_sample"]),
             "matches": [],
@@ -325,14 +330,10 @@ def _load_sessions(where: str, params: list) -> list[dict]:
     by_id = {s["id"]: s for s in sessions}
     if by_id:
         placeholders = ",".join("?" * len(by_id))
-        match_rows = conn.execute(
+        for r in conn.execute(
             f"SELECT * FROM matches WHERE session_id IN ({placeholders}) ORDER BY id", list(by_id)
-        ).fetchall()
-        matches = {r["id"]: _match_from_row(r) for r in match_rows}
-        if matches:
-            _attach_games(conn, matches)
-        for m in matches.values():
-            by_id[m["session_id"]]["matches"].append(m)
+        ).fetchall():
+            by_id[r["session_id"]]["matches"].append(_match_from_row(r))
     conn.close()
     for s in sessions:
         s["wins"] = sum(m["won"] for m in s["matches"])
@@ -346,70 +347,51 @@ def _match_from_row(row) -> dict:
     return {
         "id": row["id"],
         "session_id": row["session_id"],
+        "my_score": row["my_score"],
+        "opp_score": row["opp_score"],
+        "score": f"{row['my_score']}-{row['opp_score']}",
         "points_to_win": row["points_to_win"],
         "won": bool(row["won"]),
         "result": "win" if row["won"] else "loss",
         "notes": row["notes"],
-        "games": [],
     }
-
-
-def _attach_games(conn, matches: dict[int, dict]):
-    placeholders = ",".join("?" * len(matches))
-    for g in conn.execute(
-        f"SELECT * FROM games WHERE match_id IN ({placeholders}) ORDER BY match_id, game_no", list(matches)
-    ).fetchall():
-        matches[g["match_id"]]["games"].append({"my_score": g["my_score"], "opp_score": g["opp_score"]})
-    for m in matches.values():
-        m["score"] = ", ".join(f"{g['my_score']}-{g['opp_score']}" for g in m["games"])
-
-
-def _insert_games(conn, match_id: int, games: list[dict]):
-    conn.executemany(
-        "INSERT INTO games (match_id, game_no, my_score, opp_score) VALUES (?, ?, ?, ?)",
-        [(match_id, i, g["my_score"], g["opp_score"]) for i, g in enumerate(games, start=1)],
-    )
 
 
 def get_match(match_id: int) -> dict:
     conn = get_connection()
     row = conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
-    if row is None:
-        conn.close()
-        raise LookupError(f"match {match_id} not found")
-    matches = {row["id"]: _match_from_row(row)}
-    _attach_games(conn, matches)
     conn.close()
-    return matches[match_id]
+    if row is None:
+        raise LookupError(f"match {match_id} not found")
+    return _match_from_row(row)
 
 
-def log_match(session_id: int, games: list[dict], points_to_win: int = DEFAULT_POINTS_TO_WIN, notes: str = "") -> dict:
-    won = validate_match(games, points_to_win)
+def log_match(session_id: int, my_score: int, opp_score: int,
+              points_to_win: int = DEFAULT_POINTS_TO_WIN, notes: str = "") -> dict:
+    won = validate_score(my_score, opp_score, points_to_win)
     get_session(session_id)  # raises LookupError if missing
     conn = get_connection()
-    cursor = conn.execute(
-        "INSERT INTO matches (session_id, points_to_win, won, notes) VALUES (?, ?, ?, ?)",
-        (session_id, points_to_win, int(won), notes or ""),
-    )
-    _insert_games(conn, cursor.lastrowid, games)
+    match_id = conn.execute(
+        "INSERT INTO matches (session_id, points_to_win, won, notes, my_score, opp_score) VALUES (?, ?, ?, ?, ?, ?)",
+        (session_id, points_to_win, int(won), notes or "", my_score, opp_score),
+    ).lastrowid
     conn.commit()
     conn.close()
-    return get_match(cursor.lastrowid)
+    return get_match(match_id)
 
 
-def update_match(match_id: int, games: list[dict] | None = None, points_to_win: int | None = None,
-                 notes: str | None = None) -> dict:
+def update_match(match_id: int, my_score: int | None = None, opp_score: int | None = None,
+                 points_to_win: int | None = None, notes: str | None = None) -> dict:
     current = get_match(match_id)
-    games = games if games is not None else current["games"]
+    my_score = my_score if my_score is not None else current["my_score"]
+    opp_score = opp_score if opp_score is not None else current["opp_score"]
     points_to_win = points_to_win if points_to_win is not None else current["points_to_win"]
-    won = validate_match(games, points_to_win)
+    won = validate_score(my_score, opp_score, points_to_win)
     conn = get_connection()
     conn.execute(
-        "UPDATE matches SET points_to_win = ?, won = ?, notes = ? WHERE id = ?",
-        (points_to_win, int(won), notes if notes is not None else current["notes"], match_id),
+        "UPDATE matches SET my_score = ?, opp_score = ?, points_to_win = ?, won = ?, notes = ? WHERE id = ?",
+        (my_score, opp_score, points_to_win, int(won), notes if notes is not None else current["notes"], match_id),
     )
-    conn.execute("DELETE FROM games WHERE match_id = ?", (match_id,))
-    _insert_games(conn, match_id, games)
     conn.commit()
     conn.close()
     return get_match(match_id)
@@ -417,7 +399,6 @@ def update_match(match_id: int, games: list[dict] | None = None, points_to_win: 
 
 def delete_match(match_id: int) -> dict:
     conn = get_connection()
-    conn.execute("DELETE FROM games WHERE match_id = ?", (match_id,))
     deleted = conn.execute("DELETE FROM matches WHERE id = ?", (match_id,)).rowcount
     conn.commit()
     conn.close()
@@ -464,15 +445,9 @@ def get_overall_stats(start_date: str | None = None, end_date: str | None = None
         params,
     ).fetchone()
     m = conn.execute(
-        f"SELECT COUNT(*) AS matches, COALESCE(SUM(m.won), 0) AS wins "
+        f"SELECT COUNT(*) AS matches, COALESCE(SUM(m.won), 0) AS wins, "
+        f"COALESCE(SUM(m.my_score), 0) AS points_won, COALESCE(SUM(m.opp_score), 0) AS points_lost "
         f"FROM matches m JOIN sessions s ON s.id = m.session_id {where}",
-        params,
-    ).fetchone()
-    g = conn.execute(
-        f"SELECT COUNT(*) AS games, "
-        f"COALESCE(SUM(g.my_score > g.opp_score), 0) AS games_won, "
-        f"COALESCE(SUM(g.my_score), 0) AS points_won, COALESCE(SUM(g.opp_score), 0) AS points_lost "
-        f"FROM games g JOIN matches m ON m.id = g.match_id JOIN sessions s ON s.id = m.session_id {where}",
         params,
     ).fetchone()
     conn.close()
@@ -480,15 +455,13 @@ def get_overall_stats(start_date: str | None = None, end_date: str | None = None
         "start_date": start_date,
         "end_date": end_date,
         "sessions": s["sessions"],
-        "hours_played": round(s["minutes"] / 60, 2),
+        "hours_played": _hours(s["minutes"]),
         "matches": m["matches"],
         "wins": m["wins"],
         "losses": m["matches"] - m["wins"],
         "win_pct": _win_pct(m["wins"], m["matches"]),
-        "games_won": g["games_won"],
-        "games_lost": g["games"] - g["games_won"],
-        "points_won": g["points_won"],
-        "points_lost": g["points_lost"],
+        "points_won": m["points_won"],
+        "points_lost": m["points_lost"],
     }
 
 
@@ -545,7 +518,7 @@ def get_monthly_trend(months: int = 12) -> list[dict]:
         {
             "month": r["month"],
             "sessions": r["sessions"],
-            "hours_played": round(r["minutes"] / 60, 2),
+            "hours_played": _hours(r["minutes"]),
             "matches": r["matches"],
             "wins": r["wins"],
             "losses": r["matches"] - r["wins"],

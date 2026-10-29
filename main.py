@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import database as db
 
@@ -25,32 +25,24 @@ STATIC_DIR = Path(__file__).parent / "static"
 db.init_db()
 
 
-class Game(BaseModel):
-    my_score: int = Field(ge=0, description="Points won by you and your partner")
-    opp_score: int = Field(ge=0, description="Points won by the opponents")
-
-
-def _games(games: list[Game] | None) -> list[dict] | None:
-    return None if games is None else [g.model_dump() for g in games]
-
-
 # ---------- Step 1: MCP server ----------
 mcp = FastMCP("Badminton Tracker")
 
 
 @mcp.tool
-def log_session(session_date: str, venue: str, duration_minutes: int, notes: str = "") -> dict:
-    """Log a badminton play session. session_date must be YYYY-MM-DD. Returns the session with its id."""
-    return db.create_session(session_date, venue, duration_minutes, notes)
+def log_session(session_date: str, venue: str, duration_hours: int, notes: str = "") -> dict:
+    """Log a badminton play session. session_date must be YYYY-MM-DD; duration_hours is a
+    whole number of hours (1, 2, 3...). Returns the session with its id."""
+    return db.create_session(session_date, venue, duration_hours, notes)
 
 
 @mcp.tool
-def log_match(session_id: int, games: list[Game], points_to_win: int = 21, notes: str = "") -> dict:
-    """Log a match (best of 3) in a session. Scores are from my side's perspective,
-    e.g. [{"my_score": 21, "opp_score": 18}, {"my_score": 21, "opp_score": 15}].
-    points_to_win is 21 (default), 15, or 11; games are won by 2, capped at points_to_win + 9.
-    The win/loss result is calculated from the scores."""
-    return db.log_match(session_id, _games(games), points_to_win, notes)
+def log_match(session_id: int, my_score: int, opp_score: int, points_to_win: int = 21, notes: str = "") -> dict:
+    """Log one match (a single game) in a session, scored from my side's perspective,
+    e.g. my_score=21, opp_score=18. A session can have any number of matches.
+    points_to_win is 21 (default), 15, or 11; won by 2, capped at points_to_win + 9 (21 -> 30).
+    The win/loss result is calculated from the score."""
+    return db.log_match(session_id, my_score, opp_score, points_to_win, notes)
 
 
 @mcp.tool
@@ -61,15 +53,15 @@ def list_sessions(start_date: str = "", end_date: str = "", venue: str = "") -> 
 
 @mcp.tool
 def get_session(session_id: int) -> dict:
-    """Get one session with all its matches and game scores."""
+    """Get one session with all its matches and scores."""
     return db.get_session(session_id)
 
 
 @mcp.tool
 def update_session(session_id: int, session_date: str | None = None, venue: str | None = None,
-                   duration_minutes: int | None = None, notes: str | None = None) -> dict:
+                   duration_hours: int | None = None, notes: str | None = None) -> dict:
     """Edit a session. Only the fields you pass are changed."""
-    return db.update_session(session_id, session_date, venue, duration_minutes, notes)
+    return db.update_session(session_id, session_date, venue, duration_hours, notes)
 
 
 @mcp.tool
@@ -79,10 +71,10 @@ def delete_session(session_id: int) -> dict:
 
 
 @mcp.tool
-def update_match(match_id: int, games: list[Game] | None = None, points_to_win: int | None = None,
-                 notes: str | None = None) -> dict:
-    """Edit a match. Passing games replaces all game scores; the result is recalculated."""
-    return db.update_match(match_id, _games(games), points_to_win, notes)
+def update_match(match_id: int, my_score: int | None = None, opp_score: int | None = None,
+                 points_to_win: int | None = None, notes: str | None = None) -> dict:
+    """Edit a match. Only the fields you pass are changed; the result is recalculated."""
+    return db.update_match(match_id, my_score, opp_score, points_to_win, notes)
 
 
 @mcp.tool
@@ -93,7 +85,7 @@ def delete_match(match_id: int) -> dict:
 
 @mcp.tool
 def get_overall_stats(start_date: str = "", end_date: str = "") -> dict:
-    """Overall record: sessions, hours, matches, wins/losses, win %, games and points won/lost.
+    """Overall record: sessions, hours, matches, wins/losses, win %, and points won/lost.
     Optionally limited to a date range (YYYY-MM-DD)."""
     return db.get_overall_stats(start_date or None, end_date or None)
 
@@ -134,8 +126,8 @@ def weekly_recap(week_start: str) -> str:
    Week of {week_start}
    Sessions: N ({{hours}}h)  |  Matches: W-L ({{win %}})
    Per session: date, venue, each match's score and result
-   Points won/lost and games won/lost
-   One or two observations (e.g. close games, best venue this week).
+   Points won/lost
+   One or two observations (e.g. close scores, best venue this week).
 
 If there are no sessions that week, say so plainly instead of inventing data.
 """
@@ -180,25 +172,27 @@ async def handle_lookup_error(request: Request, exc: LookupError):
 class NewSession(BaseModel):
     session_date: str
     venue: str
-    duration_minutes: int
+    duration_hours: int
     notes: str = ""
 
 
 class SessionUpdate(BaseModel):
     session_date: str | None = None
     venue: str | None = None
-    duration_minutes: int | None = None
+    duration_hours: int | None = None
     notes: str | None = None
 
 
 class NewMatch(BaseModel):
-    games: list[Game]
+    my_score: int
+    opp_score: int
     points_to_win: int = db.DEFAULT_POINTS_TO_WIN
     notes: str = ""
 
 
 class MatchUpdate(BaseModel):
-    games: list[Game] | None = None
+    my_score: int | None = None
+    opp_score: int | None = None
     points_to_win: int | None = None
     notes: str | None = None
 
@@ -210,7 +204,7 @@ def api_list_sessions(start_date: str | None = None, end_date: str | None = None
 
 @app.post("/api/sessions", status_code=201)
 def api_create_session(body: NewSession):
-    return db.create_session(body.session_date, body.venue, body.duration_minutes, body.notes)
+    return db.create_session(body.session_date, body.venue, body.duration_hours, body.notes)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -220,7 +214,7 @@ def api_get_session(session_id: int):
 
 @app.put("/api/sessions/{session_id}")
 def api_update_session(session_id: int, body: SessionUpdate):
-    return db.update_session(session_id, body.session_date, body.venue, body.duration_minutes, body.notes)
+    return db.update_session(session_id, body.session_date, body.venue, body.duration_hours, body.notes)
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -230,12 +224,12 @@ def api_delete_session(session_id: int):
 
 @app.post("/api/sessions/{session_id}/matches", status_code=201)
 def api_log_match(session_id: int, body: NewMatch):
-    return db.log_match(session_id, _games(body.games), body.points_to_win, body.notes)
+    return db.log_match(session_id, body.my_score, body.opp_score, body.points_to_win, body.notes)
 
 
 @app.put("/api/matches/{match_id}")
 def api_update_match(match_id: int, body: MatchUpdate):
-    return db.update_match(match_id, _games(body.games), body.points_to_win, body.notes)
+    return db.update_match(match_id, body.my_score, body.opp_score, body.points_to_win, body.notes)
 
 
 @app.delete("/api/matches/{match_id}")

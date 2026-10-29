@@ -20,8 +20,4 @@ def fresh_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def session():
-    return db.create_session("2026-10-01", "Sports Hub", 90)
-
-
-def games(*scores):
-    return [{"my_score": m, "opp_score": o} for m, o in scores]
+    return db.create_session("2026-10-01", "Sports Hub", 2)

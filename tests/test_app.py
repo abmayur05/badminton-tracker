@@ -10,7 +10,7 @@ client = TestClient(app)
 
 
 def _new_session(**overrides):
-    body = {"session_date": "2026-10-01", "venue": "Sports Hub", "duration_minutes": 90, **overrides}
+    body = {"session_date": "2026-10-01", "venue": "Sports Hub", "duration_hours": 2, **overrides}
     return client.post("/api/sessions", json=body)
 
 
@@ -20,9 +20,9 @@ def test_session_and_match_crud_flow():
     res = _new_session()
     assert res.status_code == 201
     sid = res.json()["id"]
+    assert res.json()["duration_hours"] == 2
 
-    res = client.post(f"/api/sessions/{sid}/matches",
-                      json={"games": [{"my_score": 21, "opp_score": 18}, {"my_score": 21, "opp_score": 15}]})
+    res = client.post(f"/api/sessions/{sid}/matches", json={"my_score": 21, "opp_score": 18})
     assert res.status_code == 201
     mid = res.json()["id"]
     assert res.json()["result"] == "win"
@@ -30,8 +30,8 @@ def test_session_and_match_crud_flow():
     res = client.put(f"/api/matches/{mid}", json={"notes": "edited"})
     assert res.status_code == 200 and res.json()["notes"] == "edited"
 
-    res = client.put(f"/api/sessions/{sid}", json={"duration_minutes": 120})
-    assert res.status_code == 200 and res.json()["duration_minutes"] == 120
+    res = client.put(f"/api/sessions/{sid}", json={"duration_hours": 3})
+    assert res.status_code == 200 and res.json()["duration_hours"] == 3
 
     assert client.get(f"/api/sessions/{sid}").json()["matches"][0]["id"] == mid
     assert client.get("/api/stats/overall").json()["wins"] == 1
@@ -46,9 +46,10 @@ def test_invalid_input_returns_400_with_message():
     assert res.status_code == 400
     assert "YYYY-MM-DD" in res.json()["detail"]
 
+    assert _new_session(duration_hours=0).status_code == 400
+
     sid = _new_session().json()["id"]
-    res = client.post(f"/api/sessions/{sid}/matches",
-                      json={"games": [{"my_score": 21, "opp_score": 20}, {"my_score": 21, "opp_score": 15}]})
+    res = client.post(f"/api/sessions/{sid}/matches", json={"my_score": 21, "opp_score": 20})
     assert res.status_code == 400
     assert "21-20" in res.json()["detail"]
 
@@ -56,14 +57,13 @@ def test_invalid_input_returns_400_with_message():
 def test_unknown_ids_return_404():
     assert client.delete("/api/sessions/999").status_code == 404
     assert client.put("/api/matches/999", json={"notes": "x"}).status_code == 404
-    res = client.post("/api/sessions/999/matches",
-                      json={"games": [{"my_score": 21, "opp_score": 1}, {"my_score": 21, "opp_score": 1}]})
+    res = client.post("/api/sessions/999/matches", json={"my_score": 21, "opp_score": 1})
     assert res.status_code == 404
     assert res.json()["detail"] == "session 999 not found"
 
 
 def test_sample_data_endpoints():
-    db.create_session("2026-09-01", "Old Hall", 60, _is_sample=True)
+    db.create_session("2026-09-01", "Old Hall", 1, _is_sample=True)
     assert client.get("/api/sample-data").json() == {"has_sample_data": True}
     assert client.delete("/api/sample-data").json() == {"deleted_sessions": 1}
     assert client.get("/api/sample-data").json() == {"has_sample_data": False}
@@ -105,19 +105,16 @@ def test_mcp_logging_is_visible_to_rest_api():
     async def log_via_mcp():
         async with Client(mcp) as c:
             session = await c.call_tool("log_session",
-                                        {"session_date": "2026-10-10", "venue": "AI Court", "duration_minutes": 60})
-            await c.call_tool("log_match", {
-                "session_id": session.structured_content["id"],
-                "games": [{"my_score": 21, "opp_score": 10}, {"my_score": 21, "opp_score": 12}],
-            })
-            bad = await c.call_tool("log_match", {
-                "session_id": session.structured_content["id"],
-                "games": [{"my_score": 21, "opp_score": 20}, {"my_score": 21, "opp_score": 12}],
-            }, raise_on_error=False)
+                                        {"session_date": "2026-10-10", "venue": "AI Court", "duration_hours": 2})
+            sid = session.structured_content["id"]
+            await c.call_tool("log_match", {"session_id": sid, "my_score": 21, "opp_score": 10})
+            await c.call_tool("log_match", {"session_id": sid, "my_score": 15, "opp_score": 21})
+            bad = await c.call_tool("log_match", {"session_id": sid, "my_score": 21, "opp_score": 20},
+                                    raise_on_error=False)
             assert bad.is_error
 
     asyncio.run(log_via_mcp())
     sessions = client.get("/api/sessions").json()
     assert sessions[0]["venue"] == "AI Court"
-    assert sessions[0]["matches"][0]["score"] == "21-10, 21-12"
+    assert [m["score"] for m in sessions[0]["matches"]] == ["21-10", "15-21"]
     assert client.get("/api/venues").json() == ["AI Court"]

@@ -41,7 +41,7 @@
         <form id="sessionForm" class="grid-form">
           <label>Date <input name="session_date" type="date" required></label>
           <label>Venue <input name="venue" type="text" list="venueOptions" placeholder="e.g. Sports Hub Court 3" required></label>
-          <label>Duration (minutes) <input name="duration_minutes" type="number" min="1" max="1440" step="1" required></label>
+          <label>Duration (hours) <input name="duration_hours" type="number" min="1" max="24" step="1" placeholder="e.g. 2" required></label>
           <label class="wide">Notes <input name="notes" type="text" placeholder="Optional"></label>
           <button type="submit">Save session</button>
         </form>

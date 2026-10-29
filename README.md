@@ -24,9 +24,10 @@ If you're behind a corporate TLS proxy, use `uv sync --native-tls`.
 
 | Thing | Fields |
 |---|---|
-| Session | date, venue, duration (minutes), notes |
-| Match | best of 3 games, games to 21 (default), 15, or 11, notes |
-| Game | your score and the opponents' score |
+| Session | date, venue, duration (whole hours), notes |
+| Match | one score (yours and the opponents'), games to 21 (default), 15, or 11, notes |
+
+A session can have any number of matches.
 
 The win/loss result is **calculated from the scores**, never typed in. Scores are
 validated with rally-scoring rules: win by 2, capped at target + 9
@@ -52,7 +53,7 @@ tool). Your own sessions are untouched, and samples are never re-added.
 | Tool | `update_session` / `update_match` | Edit — only the fields passed change |
 | Tool | `delete_session` / `delete_match` | Delete (a session takes its matches with it) |
 | Tool | `list_sessions` / `get_session` | Browse history, filter by dates or venue |
-| Tool | `get_overall_stats` | Record, win %, games and points — optional date range |
+| Tool | `get_overall_stats` | Record, win %, and points — optional date range |
 | Tool | `get_venue_stats` / `get_monthly_trend` | Win % by venue; month-by-month trend |
 | Tool | `delete_sample_data` | Remove the seeded sample sessions |
 | Resource | `badminton://venues` | Venues already used, for consistent naming |

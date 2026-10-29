@@ -47,39 +47,28 @@ async function run(action, successMessage, onError = (message) => toast(message,
 
 function renderMatchFields(container, match = null) {
   const target = match?.points_to_win ?? 21;
-  const games = match?.games ?? [];
-  const rows = [0, 1, 2]
-    .map((i) => {
-      const g = games[i] ?? {};
-      return `<div class="game-row">
-        <span>Game ${i + 1}${i === 2 ? " <small>(if played)</small>" : ""}</span>
-        <input type="number" min="0" max="30" class="my" placeholder="Us" value="${esc(g.my_score)}" ${i < 2 ? "required" : ""}>
-        <span>–</span>
-        <input type="number" min="0" max="30" class="opp" placeholder="Them" value="${esc(g.opp_score)}" ${i < 2 ? "required" : ""}>
-      </div>`;
-    })
-    .join("");
   container.innerHTML = `
     <label>Games to
       <select class="points-to-win">
         ${[21, 15, 11].map((p) => `<option value="${p}" ${p === target ? "selected" : ""}>${p} points</option>`).join("")}
       </select>
     </label>
-    <div class="games">${rows}</div>
+    <div class="game-row">
+      <span>Score</span>
+      <input type="number" min="0" max="30" class="my" placeholder="Us" value="${esc(match?.my_score)}" required>
+      <span>–</span>
+      <input type="number" min="0" max="30" class="opp" placeholder="Them" value="${esc(match?.opp_score)}" required>
+    </div>
     <label>Notes <input type="text" class="match-notes" placeholder="Optional" value="${esc(match?.notes)}"></label>`;
 }
 
 function readMatchFields(container) {
-  const games = [];
-  for (const row of $$(".game-row", container)) {
-    const my = $(".my", row).value.trim();
-    const opp = $(".opp", row).value.trim();
-    if (my === "" && opp === "") continue;
-    if (my === "" || opp === "") throw new Error("Each played game needs both scores");
-    games.push({ my_score: Number(my), opp_score: Number(opp) });
-  }
+  const my = $(".my", container).value.trim();
+  const opp = $(".opp", container).value.trim();
+  if (my === "" || opp === "") throw new Error("Enter both scores");
   return {
-    games,
+    my_score: Number(my),
+    opp_score: Number(opp),
     points_to_win: Number($(".points-to-win", container).value),
     notes: $(".match-notes", container).value,
   };
@@ -87,11 +76,7 @@ function readMatchFields(container) {
 
 // ---------- sessions view ----------
 
-function formatDuration(minutes) {
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return [h && `${h}h`, m && `${m}m`].filter(Boolean).join(" ") || "0m";
-}
+const formatHours = (hours) => `${hours}h`;
 
 function renderSessions() {
   const list = $("#sessionsList");
@@ -122,7 +107,7 @@ function renderSessions() {
         <div class="session-head">
           <div>
             <h3>${esc(s.session_date)} · ${esc(s.venue)} ${s.is_sample ? `<span class="pill sample">sample</span>` : ""}</h3>
-            <p class="meta">${formatDuration(s.duration_minutes)} · ${s.wins}W – ${s.losses}L${s.notes ? ` · ${esc(s.notes)}` : ""}</p>
+            <p class="meta">${formatHours(s.duration_hours)} · ${s.wins}W – ${s.losses}L${s.notes ? ` · ${esc(s.notes)}` : ""}</p>
           </div>
           <div class="actions">
             <button class="secondary" data-action="add-match" data-id="${s.id}">+ Match</button>
@@ -192,7 +177,7 @@ function openSessionDialog(s) {
     `<div class="grid-form">
       <label>Date <input name="session_date" type="date" value="${esc(s.session_date)}" required></label>
       <label>Venue <input name="venue" type="text" list="venueOptions" value="${esc(s.venue)}" required></label>
-      <label>Duration (minutes) <input name="duration_minutes" type="number" min="1" max="1440" value="${s.duration_minutes}" required></label>
+      <label>Duration (hours) <input name="duration_hours" type="number" min="1" max="24" step="1" value="${Number.isInteger(s.duration_hours) ? s.duration_hours : ""}" required></label>
       <label class="wide">Notes <input name="notes" type="text" value="${esc(s.notes)}"></label>
     </div>`,
     () => api(`/api/sessions/${s.id}`, { method: "PUT", body: readSessionForm($("#editForm")) })
@@ -226,7 +211,7 @@ function readSessionForm(form) {
   return {
     session_date: form.elements.session_date.value,
     venue: form.elements.venue.value,
-    duration_minutes: Number(form.elements.duration_minutes.value),
+    duration_hours: Number(form.elements.duration_hours.value),
     notes: form.elements.notes.value,
   };
 }
@@ -284,7 +269,6 @@ function renderStats(overall, venues, trend) {
     ["Hours played", overall.hours_played],
     ["Matches (W-L)", `${overall.wins}-${overall.losses}`],
     ["Win %", pct(overall.win_pct)],
-    ["Games (W-L)", `${overall.games_won}-${overall.games_lost}`],
     ["Points (W-L)", `${overall.points_won}-${overall.points_lost}`],
   ];
   $("#overallStats").innerHTML = cards
