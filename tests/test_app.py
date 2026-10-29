@@ -90,6 +90,17 @@ def test_mcp_exposes_tools_resource_and_prompt():
     asyncio.run(check())
 
 
+def test_mcp_http_endpoint_works_with_and_without_trailing_slash():
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
+    headers = {"Accept": "application/json, text/event-stream"}
+    with TestClient(app) as c:  # runs the MCP lifespan
+        for path in ("/mcp", "/mcp/"):
+            res = c.post(path, json=init, headers=headers, follow_redirects=False)
+            assert res.status_code == 200, path
+            assert "Badminton Tracker" in res.text
+
+
 def test_mcp_logging_is_visible_to_rest_api():
     async def log_via_mcp():
         async with Client(mcp) as c:

@@ -151,6 +151,22 @@ mcp_app = mcp.http_app(path="/", stateless_http=True)
 app = FastAPI(title="Badminton Tracker", lifespan=mcp_app.lifespan)
 
 
+class McpPathAlias:
+    """Serve /mcp directly instead of redirecting to /mcp/ -- some MCP clients
+    (e.g. Claude's custom connectors) don't follow redirects on POST."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp":
+            scope = {**scope, "path": "/mcp/", "raw_path": b"/mcp/"}
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(McpPathAlias)
+
+
 @app.exception_handler(ValueError)
 async def handle_value_error(request: Request, exc: ValueError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
