@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Badminton Tracker</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo">🏸</div>
+      <div>
+        <h1>Badminton Tracker</h1>
+        <p class="tagline">Sessions and matches logged here, or by an AI assistant, land in the same place.</p>
+      </div>
+    </div>
+  </header>
+
+  <div id="sampleBanner" class="banner" hidden>
+    <span>You're looking at sample data.</span>
+    <button id="deleteSamplesBtn" class="danger">Delete sample data</button>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-view="sessions">Sessions</button>
+    <button class="tab" data-view="log">Log</button>
+    <button class="tab" data-view="stats">Stats</button>
+  </nav>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <main>
+    <section id="view-sessions" class="view active">
+      <div id="sessionsList"></div>
+    </section>
+
+    <section id="view-log" class="view">
+      <div class="panel">
+        <h2>New session</h2>
+        <form id="sessionForm" class="grid-form">
+          <label>Date <input name="session_date" type="date" required></label>
+          <label>Venue <input name="venue" type="text" list="venueOptions" placeholder="e.g. Sports Hub Court 3" required></label>
+          <label>Duration (minutes) <input name="duration_minutes" type="number" min="1" max="1440" step="1" required></label>
+          <label class="wide">Notes <input name="notes" type="text" placeholder="Optional"></label>
+          <button type="submit">Save session</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <h2>Add match</h2>
+        <form id="matchForm" class="grid-form">
+          <label class="wide">Session <select name="session_id" id="matchSessionSelect" required></select></label>
+          <div class="wide match-fields"></div>
+          <button type="submit">Save match</button>
+        </form>
+      </div>
+      <datalist id="venueOptions"></datalist>
+    </section>
+
+    <section id="view-stats" class="view">
+      <div id="overallStats" class="stat-cards"></div>
+      <div class="panel">
+        <h2>By venue</h2>
+        <table id="venueTable">
+          <thead><tr><th>Venue</th><th>Sessions</th><th>Matches</th><th>W-L</th><th>Win %</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>Monthly trend</h2>
+        <table id="trendTable">
+          <thead><tr><th>Month</th><th>Sessions</th><th>Hours</th><th>W-L</th><th>Win %</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="editDialog">
+    <form id="editForm" class="grid-form">
+      <h2 id="editTitle" class="wide"></h2>
+      <div id="editFields" class="wide"></div>
+      <p id="editError" class="wide form-error" role="alert" hidden></p>
+      <div class="wide dialog-actions">
+        <button type="button" id="editCancel" class="secondary">Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <footer>
+    <p>Same database, two front doors -- this page, and any MCP-connected AI assistant at <code>/mcp</code>.</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
