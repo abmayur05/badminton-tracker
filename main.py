@@ -15,10 +15,8 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastmcp import Context, FastMCP
-from fastmcp.server.elicitation import get_elicitation_schema
-from mcp.types import ElicitRequest, ElicitRequestFormParams, ElicitResult, InputRequiredResult
-from pydantic import BaseModel, Field, create_model
+from fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 import database as db
 
@@ -39,13 +37,16 @@ class SessionDetails(BaseModel):
 
 
 @mcp.tool
-async def log_session(ctx: Context, session_date: str | None = None, venue: str | None = None,
-                      duration_hours: int | None = None, notes: str = "") -> dict | InputRequiredResult:
+def log_session(session_date: str | None = None, venue: str | None = None,
+                duration_hours: int | None = None, notes: str = "") -> dict:
     """Log a badminton play session. session_date must be YYYY-MM-DD; duration_hours is a
     whole number of hours (1, 2, 3...). Pass only details the user provided; do not guess
-    missing date, venue, or duration or ask for them in chat. Call this tool even when
-    details are missing: it asks the user for missing mandatory fields via elicitation.
-    Notes are optional. Returns the saved session with its id, or decline/cancel status."""
+    missing date, venue, or duration. Partial calls return needs_input without saving.
+    When status is needs_input, ask the returned questions in ordinary chat, retain
+    provided details, and call log_session again with those details plus the user's
+    answers. Do not retry until the user answers or claim a session was saved.
+    If the user cancels, stop without retrying. Notes are optional; never ask for them.
+    Complete calls return the saved session with its id."""
     provided = {
         "session_date": session_date,
         "venue": venue,
@@ -58,55 +59,21 @@ async def log_session(ctx: Context, session_date: str | None = None, venue: str 
             isinstance(provided[name], str) and not provided[name].strip()
         )
     ]
-    if not missing:
-        details = SessionDetails.model_validate(provided)
-        return db.create_session(
-            details.session_date, details.venue, details.duration_hours, details.notes,
-        )
+    if missing:
+        questions = {
+            "session_date": "What date did you play? Please use YYYY-MM-DD.",
+            "venue": "Where did you play?",
+            "duration_hours": "How many whole hours did you play (1 to 24)?",
+        }
+        return {
+            "status": "needs_input",
+            "message": "No session was logged. Ask the missing questions in chat, then retry with all details.",
+            "missing_fields": missing,
+            "provided": {name: value for name, value in provided.items() if name not in missing},
+            "questions": {name: questions[name] for name in missing},
+        }
 
-    response_type = create_model(
-        "MissingSessionDetails",
-        **{
-            name: (SessionDetails.model_fields[name].annotation, SessionDetails.model_fields[name])
-            for name in missing
-        },
-    )
-    message = "Provide the missing details for your badminton session: " + ", ".join(missing) + "."
-    request_context = ctx.request_context
-    modern_protocol = (
-        request_context is not None
-        and request_context.protocol_version >= "2026-07-28"
-    )
-
-    if modern_protocol:
-        responses = ctx.input_responses or {}
-        result = responses.get("session_details")
-        if result is None:
-            return InputRequiredResult(
-                input_requests={
-                    "session_details": ElicitRequest(
-                        params=ElicitRequestFormParams(
-                            message=message,
-                            requested_schema=get_elicitation_schema(response_type),
-                        )
-                    )
-                }
-            )
-        if not isinstance(result, ElicitResult):
-            raise ValueError("Expected an elicitation response for session details.")
-        if result.action != "accept":
-            return {"status": result.action, "message": "No session was logged."}
-        answer = response_type.model_validate(result.content)
-    else:
-        result = await ctx.elicit(
-            message,
-            response_type=response_type,
-        )
-        if result.action != "accept":
-            return {"status": result.action, "message": "No session was logged."}
-        answer = result.data
-
-    details = SessionDetails.model_validate({**provided, **answer.model_dump()})
+    details = SessionDetails.model_validate(provided)
     return db.create_session(
         details.session_date,
         details.venue,

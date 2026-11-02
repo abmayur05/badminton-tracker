@@ -1,9 +1,9 @@
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 from fastmcp import Client
-from fastmcp.client.elicitation import ElicitResult
 
 import database as db
 from main import app, mcp
@@ -101,28 +101,36 @@ def test_mcp_exposes_tools_resource_and_prompt():
     {"session_date": "2026-10-12", "venue": "Community Centre", "duration_hours": None},
     {"session_date": "2026-10-12", "venue": "  ", "duration_hours": 2},
 ])
-def test_mcp_session_logging_elicits_only_missing_fields(mode, provided):
+def test_mcp_session_logging_requests_only_missing_fields_in_chat(mode, provided):
     details = {
         "session_date": "2026-10-12",
         "venue": "Community Centre",
         "duration_hours": 2,
     }
 
-    async def collect_session(message, response_type, params, context):
-        assert "session" in message
-        missing = {
-            key: value for key, value in details.items()
-            if provided.get(key) is None or (
-                isinstance(provided[key], str) and not provided[key].strip()
-            )
-        }
-        assert set(params.requested_schema["properties"]) == set(missing)
-        assert set(params.requested_schema["required"]) == set(missing)
-        return response_type(**missing)
-
     async def log_via_mcp():
-        async with Client(mcp, mode=mode, elicitation_handler=collect_session) as c:
+        async with Client(mcp, mode=mode) as c:
             result = await c.call_tool("log_session", {**provided, "notes": "Evening doubles"})
+            clarification = result.structured_content
+            missing = [
+                key for key in details
+                if provided.get(key) is None or (
+                    isinstance(provided[key], str) and not provided[key].strip()
+                )
+            ]
+            assert clarification["status"] == "needs_input"
+            assert clarification["missing_fields"] == missing
+            assert clarification["provided"] == {
+                **{key: value for key, value in provided.items() if key not in missing},
+                "notes": "Evening doubles",
+            }
+            assert set(clarification["questions"]) == set(missing)
+            assert not result.is_error
+            assert db.list_sessions() == []
+            result = await c.call_tool("log_session", {
+                **clarification["provided"],
+                **{key: details[key] for key in missing},
+            })
             assert result.structured_content["session_date"] == "2026-10-12"
             assert result.structured_content["venue"] == "Community Centre"
             assert result.structured_content["duration_hours"] == 2
@@ -150,14 +158,17 @@ def test_complete_mcp_session_does_not_elicit(mode):
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
-def test_invalid_elicited_session_does_not_write(mode):
-    async def invalid_date(message, response_type, params, context):
-        return response_type(session_date="2026-02-30")
-
+def test_invalid_clarification_answer_does_not_write(mode):
     async def try_invalid_session():
-        async with Client(mcp, mode=mode, elicitation_handler=invalid_date) as c:
-            result = await c.call_tool(
+        async with Client(mcp, mode=mode) as c:
+            partial = await c.call_tool(
                 "log_session", {"venue": "Sports Hub", "duration_hours": 2},
+            )
+            assert partial.structured_content["missing_fields"] == ["session_date"]
+            result = await c.call_tool(
+                "log_session", {
+                    **partial.structured_content["provided"], "session_date": "2026-02-30",
+                },
                 raise_on_error=False,
             )
             assert result.is_error
@@ -168,18 +179,11 @@ def test_invalid_elicited_session_does_not_write(mode):
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
-def test_mcp_session_logging_does_not_write_when_declined_or_cancelled(mode):
-    async def decline(message, response_type, params, context):
-        return ElicitResult(action="decline")
-
-    async def cancel(message, response_type, params, context):
-        return ElicitResult(action="cancel")
-
+def test_unanswered_clarification_does_not_write(mode):
     async def try_without_accepting():
-        for handler, expected_status in ((decline, "decline"), (cancel, "cancel")):
-            async with Client(mcp, mode=mode, elicitation_handler=handler) as c:
-                result = await c.call_tool("log_session", {"venue": "Sports Hub"})
-                assert result.structured_content["status"] == expected_status
+        async with Client(mcp, mode=mode) as c:
+            result = await c.call_tool("log_session", {"venue": "Sports Hub"})
+            assert result.structured_content["status"] == "needs_input"
 
     asyncio.run(try_without_accepting())
     assert client.get("/api/sessions").json() == []
@@ -194,6 +198,47 @@ def test_mcp_http_endpoint_works_with_and_without_trailing_slash():
             res = c.post(path, json=init, headers=headers, follow_redirects=False)
             assert res.status_code == 200, path
             assert "Badminton Tracker" in res.text
+
+
+def test_stateless_mcp_http_chat_clarification_without_back_channel():
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+    }
+
+    def call_tool(http_client, arguments):
+        response = http_client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "log_session", "arguments": arguments},
+        })
+        assert response.status_code == 200
+        if response.headers["content-type"].startswith("text/event-stream"):
+            messages = [
+                json.loads(line[5:].strip())
+                for line in response.text.splitlines() if line.startswith("data:")
+            ]
+            assert len(messages) == 1
+            payload = messages[0]
+        else:
+            payload = response.json()
+        assert "error" not in payload
+        assert not payload["result"].get("isError", False)
+        return payload["result"]["structuredContent"]
+
+    with TestClient(app) as http_client:
+        partial = call_tool(http_client, {
+            "session_date": "2026-11-02", "venue": "Sports Hub", "notes": "Doubles",
+        })
+        assert partial["status"] == "needs_input"
+        assert partial["missing_fields"] == ["duration_hours"]
+        assert partial["questions"] == {
+            "duration_hours": "How many whole hours did you play (1 to 24)?",
+        }
+        assert db.list_sessions() == []
+        complete = call_tool(http_client, {**partial["provided"], "duration_hours": 2})
+        assert complete["duration_hours"] == 2
+        assert complete["notes"] == "Doubles"
+    assert len(db.list_sessions()) == 1
 
 
 def test_mcp_logging_is_visible_to_rest_api():

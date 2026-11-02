@@ -60,10 +60,16 @@ tool). Your own sessions are untouched, and samples are never re-added.
 | Prompt | `weekly_recap` | Builds a weekly performance recap |
 
 `log_session` accepts partial details. If the date, venue, or duration is missing,
-it requests only those mandatory fields through MCP elicitation, preserving
-details already provided. Notes are optional and never trigger a question.
-Declining or cancelling creates no session. Complete calls save directly without
-a form, as before. Partial calls require an elicitation-capable MCP client.
+it returns `status: "needs_input"` with `missing_fields`, `provided` details, and
+`questions` for only those mandatory fields. Claude asks those questions in ordinary
+chat, then calls the tool again with the original details and the user's answers.
+No session is saved until a complete, valid call is received. Notes are optional
+and never trigger a question. If the user cancels or does not answer, the assistant
+must stop without retrying.
+
+This uses normal tool responses, not MCP elicitation forms or server-initiated
+requests, so it works over stateless HTTP without an elicitation back-channel.
+Complete calls save directly as before. The website and REST API are unchanged.
 
 Try natural messages in your connected assistant:
 
@@ -72,10 +78,11 @@ Try natural messages in your connected assistant:
 - "Log badminton on 2026-11-02 for 2 hours." (asks only for venue)
 - "Log badminton on 2026-11-02 at Sports Hub for 2 hours." (saves directly)
 
-The assistant must call `log_session` for the server to request a form. Its tool
-description instructs it to pass partial details rather than ask in chat, but the
-client controls tool selection and form rendering. A hosted connector needs the
-updated deployment and a refreshed tool list.
+The tool description guides Claude Desktop to ask missing-field questions in chat
+and preserve supplied details across calls; the assistant still controls the
+conversation and tool selection. A hosted connector needs the updated deployment
+and a refreshed tool list. End-to-end conversation behavior must be checked in
+Claude Desktop; automated tests verify the tool response and retry flow.
 
 Connect an MCP client such as Claude Desktop:
 
