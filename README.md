@@ -59,6 +59,24 @@ tool). Your own sessions are untouched, and samples are never re-added.
 | Resource | `badminton://venues` | Venues already used, for consistent naming |
 | Prompt | `weekly_recap` | Builds a weekly performance recap |
 
+`log_session` accepts partial details. If the date, venue, or duration is missing,
+it requests only those mandatory fields through MCP elicitation, preserving
+details already provided. Notes are optional and never trigger a question.
+Declining or cancelling creates no session. Complete calls save directly without
+a form, as before. Partial calls require an elicitation-capable MCP client.
+
+Try natural messages in your connected assistant:
+
+- "Log a badminton session." (asks for date, venue, and duration)
+- "Log badminton on 2026-11-02 at Sports Hub." (asks only for duration)
+- "Log badminton on 2026-11-02 for 2 hours." (asks only for venue)
+- "Log badminton on 2026-11-02 at Sports Hub for 2 hours." (saves directly)
+
+The assistant must call `log_session` for the server to request a form. Its tool
+description instructs it to pass partial details rather than ask in chat, but the
+client controls tool selection and form rendering. A hosted connector needs the
+updated deployment and a refreshed tool list.
+
 Connect an MCP client such as Claude Desktop:
 
 ```json

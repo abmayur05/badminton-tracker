@@ -15,8 +15,10 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastmcp import FastMCP
-from pydantic import BaseModel
+from fastmcp import Context, FastMCP
+from fastmcp.server.elicitation import get_elicitation_schema
+from mcp.types import ElicitRequest, ElicitRequestFormParams, ElicitResult, InputRequiredResult
+from pydantic import BaseModel, Field, create_model
 
 import database as db
 
@@ -29,11 +31,88 @@ db.init_db()
 mcp = FastMCP("Badminton Tracker")
 
 
+class SessionDetails(BaseModel):
+    session_date: str = Field(description="Session date in YYYY-MM-DD format.")
+    venue: str = Field(min_length=1, description="Name of the badminton venue.")
+    duration_hours: int = Field(ge=1, le=24, description="Whole number of hours, from 1 to 24.")
+    notes: str = Field(default="", description="Optional notes about the session.")
+
+
 @mcp.tool
-def log_session(session_date: str, venue: str, duration_hours: int, notes: str = "") -> dict:
+async def log_session(ctx: Context, session_date: str | None = None, venue: str | None = None,
+                      duration_hours: int | None = None, notes: str = "") -> dict | InputRequiredResult:
     """Log a badminton play session. session_date must be YYYY-MM-DD; duration_hours is a
-    whole number of hours (1, 2, 3...). Returns the session with its id."""
-    return db.create_session(session_date, venue, duration_hours, notes)
+    whole number of hours (1, 2, 3...). Pass only details the user provided; do not guess
+    missing date, venue, or duration or ask for them in chat. Call this tool even when
+    details are missing: it asks the user for missing mandatory fields via elicitation.
+    Notes are optional. Returns the saved session with its id, or decline/cancel status."""
+    provided = {
+        "session_date": session_date,
+        "venue": venue,
+        "duration_hours": duration_hours,
+        "notes": notes,
+    }
+    missing = [
+        name for name in ("session_date", "venue", "duration_hours")
+        if provided[name] is None or (
+            isinstance(provided[name], str) and not provided[name].strip()
+        )
+    ]
+    if not missing:
+        details = SessionDetails.model_validate(provided)
+        return db.create_session(
+            details.session_date, details.venue, details.duration_hours, details.notes,
+        )
+
+    response_type = create_model(
+        "MissingSessionDetails",
+        **{
+            name: (SessionDetails.model_fields[name].annotation, SessionDetails.model_fields[name])
+            for name in missing
+        },
+    )
+    message = "Provide the missing details for your badminton session: " + ", ".join(missing) + "."
+    request_context = ctx.request_context
+    modern_protocol = (
+        request_context is not None
+        and request_context.protocol_version >= "2026-07-28"
+    )
+
+    if modern_protocol:
+        responses = ctx.input_responses or {}
+        result = responses.get("session_details")
+        if result is None:
+            return InputRequiredResult(
+                input_requests={
+                    "session_details": ElicitRequest(
+                        params=ElicitRequestFormParams(
+                            message=message,
+                            requested_schema=get_elicitation_schema(response_type),
+                        )
+                    )
+                }
+            )
+        if not isinstance(result, ElicitResult):
+            raise ValueError("Expected an elicitation response for session details.")
+        if result.action != "accept":
+            return {"status": result.action, "message": "No session was logged."}
+        answer = response_type.model_validate(result.content)
+    else:
+        result = await ctx.elicit(
+            message,
+            response_type=response_type,
+        )
+        if result.action != "accept":
+            return {"status": result.action, "message": "No session was logged."}
+        answer = result.data
+
+    details = SessionDetails.model_validate({**provided, **answer.model_dump()})
+    return db.create_session(
+        details.session_date,
+        details.venue,
+        details.duration_hours,
+        details.notes,
+    )
 
 
 @mcp.tool

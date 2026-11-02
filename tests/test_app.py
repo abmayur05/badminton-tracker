@@ -1,7 +1,9 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 from fastmcp import Client
+from fastmcp.client.elicitation import ElicitResult
 
 import database as db
 from main import app, mcp
@@ -88,6 +90,99 @@ def test_mcp_exposes_tools_resource_and_prompt():
             assert "weekly_recap" in {p.name for p in await c.list_prompts()}
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+@pytest.mark.parametrize("provided", [
+    {},
+    {"session_date": "2026-10-12"},
+    {"session_date": "2026-10-12", "venue": "Community Centre"},
+    {"venue": "Community Centre", "duration_hours": 2},
+    {"session_date": "2026-10-12", "venue": "Community Centre", "duration_hours": None},
+    {"session_date": "2026-10-12", "venue": "  ", "duration_hours": 2},
+])
+def test_mcp_session_logging_elicits_only_missing_fields(mode, provided):
+    details = {
+        "session_date": "2026-10-12",
+        "venue": "Community Centre",
+        "duration_hours": 2,
+    }
+
+    async def collect_session(message, response_type, params, context):
+        assert "session" in message
+        missing = {
+            key: value for key, value in details.items()
+            if provided.get(key) is None or (
+                isinstance(provided[key], str) and not provided[key].strip()
+            )
+        }
+        assert set(params.requested_schema["properties"]) == set(missing)
+        assert set(params.requested_schema["required"]) == set(missing)
+        return response_type(**missing)
+
+    async def log_via_mcp():
+        async with Client(mcp, mode=mode, elicitation_handler=collect_session) as c:
+            result = await c.call_tool("log_session", {**provided, "notes": "Evening doubles"})
+            assert result.structured_content["session_date"] == "2026-10-12"
+            assert result.structured_content["venue"] == "Community Centre"
+            assert result.structured_content["duration_hours"] == 2
+
+    asyncio.run(log_via_mcp())
+    sessions = client.get("/api/sessions").json()
+    assert len(sessions) == 1
+    assert sessions[0]["notes"] == "Evening doubles"
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+def test_complete_mcp_session_does_not_elicit(mode):
+    async def unexpected_form(*args):
+        pytest.fail("A complete session must not request input.")
+
+    async def log_complete_session():
+        async with Client(mcp, mode=mode, elicitation_handler=unexpected_form) as c:
+            result = await c.call_tool("log_session", {
+                "session_date": "2026-11-02", "venue": "Sports Hub", "duration_hours": 2,
+            })
+            assert result.structured_content["notes"] == ""
+
+    asyncio.run(log_complete_session())
+    assert len(db.list_sessions()) == 1
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+def test_invalid_elicited_session_does_not_write(mode):
+    async def invalid_date(message, response_type, params, context):
+        return response_type(session_date="2026-02-30")
+
+    async def try_invalid_session():
+        async with Client(mcp, mode=mode, elicitation_handler=invalid_date) as c:
+            result = await c.call_tool(
+                "log_session", {"venue": "Sports Hub", "duration_hours": 2},
+                raise_on_error=False,
+            )
+            assert result.is_error
+            assert "YYYY-MM-DD" in result.content[0].text
+
+    asyncio.run(try_invalid_session())
+    assert db.list_sessions() == []
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+def test_mcp_session_logging_does_not_write_when_declined_or_cancelled(mode):
+    async def decline(message, response_type, params, context):
+        return ElicitResult(action="decline")
+
+    async def cancel(message, response_type, params, context):
+        return ElicitResult(action="cancel")
+
+    async def try_without_accepting():
+        for handler, expected_status in ((decline, "decline"), (cancel, "cancel")):
+            async with Client(mcp, mode=mode, elicitation_handler=handler) as c:
+                result = await c.call_tool("log_session", {"venue": "Sports Hub"})
+                assert result.structured_content["status"] == expected_status
+
+    asyncio.run(try_without_accepting())
+    assert client.get("/api/sessions").json() == []
 
 
 def test_mcp_http_endpoint_works_with_and_without_trailing_slash():
