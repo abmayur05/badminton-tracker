@@ -71,6 +71,11 @@ This uses normal tool responses, not MCP elicitation forms or server-initiated
 requests, so it works over stateless HTTP without an elicitation back-channel.
 Complete calls save directly as before. The website and REST API are unchanged.
 
+Server instructions tell the assistant to keep session and match IDs internal
+and never ask users for database IDs. Confirmations and clarification questions
+should use dates, venues, durations, and scores instead. IDs remain in tool results for follow-up operations; this is
+presentation guidance, not a restriction on inspecting raw tool results.
+
 Try natural messages in your connected assistant:
 
 - "Log a badminton session." (asks for date, venue, and duration)

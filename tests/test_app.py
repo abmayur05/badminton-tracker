@@ -82,7 +82,10 @@ def test_index_page_served():
 def test_mcp_exposes_tools_resource_and_prompt():
     async def check():
         async with Client(mcp) as c:
-            tools = {t.name for t in await c.list_tools()}
+            tool_list = await c.list_tools()
+            tools = {t.name for t in tool_list}
+            log_description = next(t.description for t in tool_list if t.name == "log_session")
+            assert "never show it in user-facing replies" in log_description
             assert {"log_session", "log_match", "update_match", "delete_match", "update_session",
                     "delete_session", "list_sessions", "get_session", "get_overall_stats",
                     "get_venue_stats", "get_monthly_trend", "delete_sample_data"} <= tools
@@ -198,6 +201,8 @@ def test_mcp_http_endpoint_works_with_and_without_trailing_slash():
             res = c.post(path, json=init, headers=headers, follow_redirects=False)
             assert res.status_code == 200, path
             assert "Badminton Tracker" in res.text
+            assert "Keep database IDs internal." in res.text
+            assert "never ask users to supply database IDs" in res.text
 
 
 def test_stateless_mcp_http_chat_clarification_without_back_channel():

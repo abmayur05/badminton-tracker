@@ -26,7 +26,17 @@ db.init_db()
 
 
 # ---------- Step 1: MCP server ----------
-mcp = FastMCP("Badminton Tracker")
+mcp = FastMCP(
+    "Badminton Tracker",
+    instructions=(
+        "Keep database IDs internal. Do not display session IDs, match IDs, or "
+        "foreign-key values in user-facing replies. Use dates, venues, durations, "
+        "and scores to identify records in "
+        "confirmations and questions. Retain IDs from tool results for follow-up "
+        "tool calls; never ask users to supply database IDs. Look up records and "
+        "resolve ambiguity by asking about dates, venues, or scores instead."
+    ),
+)
 
 
 class SessionDetails(BaseModel):
@@ -46,7 +56,9 @@ def log_session(session_date: str | None = None, venue: str | None = None,
     provided details, and call log_session again with those details plus the user's
     answers. Do not retry until the user answers or claim a session was saved.
     If the user cancels, stop without retrying. Notes are optional; never ask for them.
-    Complete calls return the saved session with its id."""
+    Complete calls return the saved session. Its id is for internal follow-up tool
+    calls only; never show it in user-facing replies. Confirm logging
+    using the session date, venue, and duration instead."""
     provided = {
         "session_date": session_date,
         "venue": venue,
